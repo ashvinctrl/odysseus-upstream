@@ -20,6 +20,19 @@ def _database_models():
     return ChatMessage, GalleryImage, SessionLocal
 
 
+def _session_owner(db, session_id: str):
+    from core.database import Session as DbSession
+
+    row = db.query(DbSession.owner).filter(DbSession.id == session_id).first()
+    return getattr(row, "owner", None) if row is not None else None
+
+
+def _auth_disabled() -> bool:
+    from src.auth_helpers import _auth_disabled as _impl
+
+    return _impl()
+
+
 def _generated_image_path_for_cleanup(filename: str) -> Path | None:
     if not isinstance(filename, str) or not filename:
         return None
@@ -90,14 +103,41 @@ def cleanup_session_images(session_id: str, db=None) -> int:
         image_ids, filenames = session_image_refs(db, session_id)
         query = db.query(GalleryImage).filter(GalleryImage.session_id == session_id)
         if image_ids or filenames:
-            from sqlalchemy import or_
+            from sqlalchemy import and_, or_
 
-            clauses = [GalleryImage.session_id == session_id]
+            # Ids and filenames come out of chat message metadata, which is
+            # caller-supplied (POST /api/session/{sid}/inject_messages stores
+            # it verbatim). Matching on them alone let a chat delete gallery
+            # rows it does not own, so keep the reference match but require the
+            # row to belong to this session's owner and to not already be
+            # attached to a different chat.
+            ref_clauses = []
             if image_ids:
-                clauses.append(GalleryImage.id.in_(list(image_ids)))
+                ref_clauses.append(GalleryImage.id.in_(list(image_ids)))
             if filenames:
-                clauses.append(GalleryImage.filename.in_(list(filenames)))
-            query = db.query(GalleryImage).filter(or_(*clauses))
+                ref_clauses.append(GalleryImage.filename.in_(list(filenames)))
+
+            referenced = and_(
+                or_(*ref_clauses),
+                or_(
+                    GalleryImage.session_id.is_(None),
+                    GalleryImage.session_id == session_id,
+                ),
+            )
+            # Same three cases the gallery's own _owner_filter handles: exact
+            # match for a real owner, unrestricted for single-user/auth-off
+            # where there is no boundary, and fail closed in between — a
+            # session with no owner while auth is on (created before auth was
+            # turned on, or legacy) must not reach rows that belong to someone.
+            owner = _session_owner(db, session_id)
+            if owner:
+                referenced = and_(referenced, GalleryImage.owner == owner)
+            elif not _auth_disabled():
+                referenced = and_(referenced, GalleryImage.owner.is_(None))
+
+            query = db.query(GalleryImage).filter(
+                or_(GalleryImage.session_id == session_id, referenced)
+            )
 
         images = query.all()
         removed = 0
