@@ -16,6 +16,9 @@ exactly what made issue #6132's volume fix look like it had not worked.
 ``search`` now rebuilds the client and lanes once per throttle window and
 retries, so the next query recovers on its own.
 """
+import threading
+import types
+
 import pytest
 
 from src import rag_vector
@@ -74,7 +77,7 @@ def _store(state, collection=None):
         collection = _FakeCollection([("doc_1", "the indexed answer", {"owner": "alice"})])
     store._collection = collection
     store._lanes = [_FakeLane(store._collection, state)]
-    store._last_reconnect = 0.0
+    store._last_reconnect = None
     return store
 
 
@@ -225,7 +228,6 @@ def test_healthy_but_empty_index_answers_without_reconnecting(backend):
     store = _store(backend, _FakeCollection())
 
     assert store.search("nothing is indexed yet", k=3) == []
-    store._last_reconnect -= rag_vector.RECONNECT_THROTTLE_SECONDS + 1
     assert store.search("still nothing", k=3) == []
 
     assert backend["resets"] == 0, (
@@ -248,4 +250,63 @@ def test_handles_that_count_but_cannot_query_still_recover(backend):
     assert [r["id"] for r in results] == ["doc_1"]
     assert backend["resets"] == 1, (
         "a lane that counts but cannot serve a query must still reconnect"
+    )
+
+
+def test_first_reconnect_is_not_throttled_shortly_after_boot(backend, monkeypatch):
+    """No earlier attempt means nothing to throttle against.
+
+    ``time.monotonic`` counts from an arbitrary point, commonly host boot, so
+    a zero "last attempt" timestamp suppressed the very first reconnect for as
+    long as the clock read under the throttle window.
+    """
+    monkeypatch.setattr(rag_vector, "time", types.SimpleNamespace(monotonic=lambda: 5.0))
+
+    store = _store(backend)
+    results = store.search("the indexed answer", k=3, owner="alice")
+
+    assert [r["id"] for r in results] == ["doc_1"]
+    assert backend["resets"] == 1
+
+
+def test_concurrent_reconnects_rebuild_the_client_once(backend):
+    """Two queries hitting stale handles together must not both reset the client."""
+    first_read = threading.Event()
+    second_read = threading.Event()
+    reads = []
+
+    class _SlowToReadStore(VectorRAG):
+        # Hold the first caller right after it reads the last attempt time and
+        # before it records its own, which is where an unguarded second caller
+        # slips past the throttle.
+        @property
+        def _last_reconnect(self):
+            value = self.__dict__.get("_last_reconnect")
+            reads.append(value)
+            if len(reads) == 1:
+                first_read.set()
+                second_read.wait(timeout=0.5)
+            else:
+                second_read.set()
+            return value
+
+        @_last_reconnect.setter
+        def _last_reconnect(self, value):
+            self.__dict__["_last_reconnect"] = value
+
+    backend["service_up"] = False
+    store = _store(backend)
+    store.__class__ = _SlowToReadStore
+
+    first = threading.Thread(target=store._reconnect_backend)
+    first.start()
+    assert first_read.wait(timeout=5)
+    second = threading.Thread(target=store._reconnect_backend)
+    second.start()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert backend["resets"] == 1, (
+        "the second caller must wait for the reconnect in progress and then "
+        "fall inside its throttle window, not reset the shared client again"
     )

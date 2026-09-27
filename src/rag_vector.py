@@ -10,6 +10,7 @@ import os
 import hashlib
 import re
 import logging
+import threading
 import time
 import numpy as np
 from typing import List, Dict, Any, Optional, Set
@@ -82,13 +83,19 @@ def _rewrite_owner_path(value: str, path_map: Dict[str, str], path_prefixes: Lis
 class VectorRAG:
     """RAG system using ChromaDB vector storage with hybrid search."""
 
+    # Reconnecting resets the process-wide client in src.chroma_client, so the
+    # lock is shared by every instance rather than held per store. None means
+    # no reconnect has been attempted yet, so the first one is never throttled.
+    _reconnect_lock = threading.Lock()
+    _last_reconnect: Optional[float] = None
+
     def __init__(self, persist_directory: str = CHROMA_DIR):
         self.persist_directory = persist_directory
         self._collection = None
         self._model = None
         self._lanes = []
         self._healthy = False
-        self._last_reconnect = 0.0
+        self._last_reconnect = None
 
         Path(self.persist_directory).mkdir(parents=True, exist_ok=True)
         self._initialize_system()
@@ -364,19 +371,21 @@ class VectorRAG:
         answers it happily while every cached handle still points at the
         previous container's collections.
         """
-        now = time.monotonic()
-        if now - getattr(self, "_last_reconnect", 0.0) < RECONNECT_THROTTLE_SECONDS:
-            return False
-        self._last_reconnect = now
-        try:
-            from src.chroma_client import get_chroma_client, reset_client
+        with self._reconnect_lock:
+            now = time.monotonic()
+            last = self._last_reconnect
+            if last is not None and now - last < RECONNECT_THROTTLE_SECONDS:
+                return False
+            self._last_reconnect = now
+            try:
+                from src.chroma_client import get_chroma_client, reset_client
 
-            reset_client()
-            get_chroma_client()
-        except Exception as e:
-            logger.warning(f"ChromaDB reconnect failed: {e}")
-            return False
-        return self._initialize_system()
+                reset_client()
+                get_chroma_client()
+            except Exception as e:
+                logger.warning(f"ChromaDB reconnect failed: {e}")
+                return False
+            return self._initialize_system()
 
     def search(self, query: str, k: int = 5, owner: Optional[str] = None) -> List[Dict[str, Any]]:
         if not query or not isinstance(query, str):
